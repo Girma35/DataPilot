@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+psycopg2-binary
+sqlalchemy
+asyncpg
+pandas
+numpy
+langchain
+langgraph
+openai
+chromadb
+matplotlib
+plotly
+apscheduler
+reportlab
+python-dotenv
+requests
