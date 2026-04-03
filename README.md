@@ -41,6 +41,18 @@ From the **DataPilot** folder (so `config` and packages resolve):
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+**API + Next.js together**
+
+```bash
+./scripts/dev-all.sh
+```
+
+**GLPI in Docker** (optional; then finish setup at http://localhost:8080 and enable the REST API + app tokens)
+
+```bash
+docker compose -f docker-compose.glpi.yml up -d
+```
+
 ## Example API request
 
 **Health check**
@@ -57,7 +69,32 @@ curl -s -X POST http://localhost:8000/query \
   -d '{"sql": "SELECT 1 AS one", "limit": 10}'
 ```
 
+## Web UI + Auth0 (optional)
+
+From `web/`:
+
+```bash
+npm install
+npm run dev
+```
+
+The UI loads `.env` from the **repository root** (see `web/next.config.ts`). Set `NEXT_PUBLIC_AUTH0_*` and `DATAPILOT_API_URL` there.
+
+## Auth0 Token Vault (intermediary agent → Slack)
+
+`POST /agent/slack` exchanges the caller’s **Auth0 access token** (audience = your **DataPilot Custom API**) for a **Slack access token** stored in **Token Vault**, then calls Slack `chat.postMessage`. This matches the **Authorized to Act** hackathon pattern: OAuth, consent, and refresh are handled by Auth0; your backend never stores Slack secrets.
+
+**Dashboard checklist (summary):**
+
+1. Create a **Custom API** (identifier = e.g. `https://datapilot-api`) — use the same value for `AUTH0_AUDIENCE` (API) and `NEXT_PUBLIC_AUTH0_AUDIENCE` (SPA).
+2. Enable **Token Vault** and **access token exchange** for that API ([configure Token Vault](https://auth0.com/docs/secure/tokens/token-vault/configure-token-vault)).
+3. Create a **Custom API client** linked to that API with the Token Vault grant; set `AUTH0_TOKEN_VAULT_CLIENT_ID` / `AUTH0_TOKEN_VAULT_CLIENT_SECRET`.
+4. Add a **Slack** social connection with **Connected Accounts for Token Vault** enabled; set `AUTH0_VAULT_SLACK_CONNECTION` to the connection name (often `slack`).
+5. Complete the **Connected Accounts** flow for your test user (My Account API + [MRRT](https://auth0.com/docs/secure/tokens/refresh-tokens/multi-resource-refresh-token) as in Auth0 docs) so Slack appears under the user’s connected accounts.
+6. Optional: `NEXT_PUBLIC_AUTH0_ADDITIONAL_SCOPES` for My Account scopes (e.g. `create:me:connected_accounts read:me:connected_accounts`) when you implement the connect UI.
+
+Env vars: see `.env.example`.
+
 ## Security note
 
 Only **read-only** SQL is allowed. Statements containing `DELETE`, `DROP`, `UPDATE`, or `INSERT` are rejected before execution.
-# DataPilot

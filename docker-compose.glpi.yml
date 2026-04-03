@@ -1,0 +1,33 @@
+# Optional GLPI stack for local demos (matches GLPI_API_URL=http://localhost:8080/apirest.php)
+# Start:  docker compose -f docker-compose.glpi.yml up -d
+# Setup:  open http://localhost:8080 and complete GLPI install wizard (DB below)
+# Stop:   docker compose -f docker-compose.glpi.yml down
+
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: glpi_root
+      MYSQL_DATABASE: glpi
+      MYSQL_USER: glpi
+      MYSQL_PASSWORD: glpi_pass
+    volumes:
+      - glpi_mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  glpi:
+    image: diouxx/glpi
+    ports:
+      - "8080:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TIMEZONE: UTC
+
+volumes:
+  glpi_mariadb:

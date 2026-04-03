@@ -57,3 +57,55 @@ class GLPIWebhookResponse(BaseModel):
     processed: bool = False
     alert_sent: bool = False
     error: Optional[str] = None
+    glpi_followup_ok: Optional[bool] = None
+    glpi_followup_error: Optional[str] = None
+    glpi_status_updated: Optional[bool] = None
+    glpi_status_error: Optional[str] = None
+
+
+class ChannelGlpiAgentRequest(BaseModel):
+    """Simulate a chat message for the GLPI channel agent (testing without Slack)."""
+
+    message: str = Field(..., min_length=1)
+    context_ticket_id: Optional[int] = Field(
+        default=None,
+        description="Default ticket if the message does not include #id",
+    )
+
+
+class ChannelGlpiAgentResponse(BaseModel):
+    ok: bool
+    action: Optional[str] = None
+    error: Optional[str] = None
+    message: Optional[str] = None
+    glpi: Optional[dict[str, Any]] = None
+    plan: Optional[dict[str, Any]] = None
+
+
+class AgentSlackNotifyRequest(BaseModel):
+    """Intermediary agent: post to Slack using Token Vault (user's connected Slack account)."""
+
+    message: str = Field(..., min_length=1, description="Message text for chat.postMessage")
+    slack_channel: str = Field(
+        ...,
+        min_length=1,
+        description="Slack channel ID (e.g. C0123…) or channel name",
+    )
+    connection: Optional[str] = Field(
+        default=None,
+        description="Auth0 connection name if not the default (AUTH0_VAULT_SLACK_CONNECTION)",
+    )
+    login_hint: Optional[str] = Field(
+        default=None,
+        description="Optional login_hint when the user has multiple accounts on the same connection",
+    )
+
+
+class AgentSlackNotifyResponse(BaseModel):
+    ok: bool
+    user_sub: Optional[str] = None
+    slack: Optional[dict[str, Any]] = None
+    vault_meta: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    detail: Optional[str] = None
+    auth0: Optional[dict[str, Any]] = None

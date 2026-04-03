@@ -1,155 +1,303 @@
-"""GLPI webhook service for processing incoming ticket notifications."""
+"""GLPI webhook: new/open tickets → rich channel message + optional GLPI API follow-up / status."""
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
+from config import (
+    GLPI_WEBHOOK_ADD_FOLLOWUP,
+    GLPI_WEBHOOK_EVENTS_MODE,
+    GLPI_WEBHOOK_STATUS_ID,
+)
 from models.schemas import GLPIWebhookRequest, GLPIWebhookResponse
+from services.ai_message_service import get_ai_message_service
+from services.glpi_api_service import get_glpi_api_service
 
 logger = logging.getLogger(__name__)
 
+# Primary workflow: ticket opened / created / reopened
+_OPEN_TICKET_EVENTS = frozenset(
+    {
+        "ticket.created",
+        "ticket.new",
+        "ticket.opened",
+        "ticket.open",
+        "ticket.reopened",
+        "ticket.reopen",
+        "glpi.ticket.created",
+        "ticket.add",
+    }
+)
+
+# When GLPI_WEBHOOK_EVENTS_MODE=all, also notify on these (legacy behaviour)
+_EXTENDED_EVENTS = frozenset(
+    {
+        "ticket.updated",
+        "ticket.closed",
+        "ticket.resolved",
+        "ticket.reply",
+        "ticket.note",
+        "ticket.assigned",
+        "ticket.priority_changed",
+        "ticket.status_changed",
+    }
+)
+
+_DISCORD_MAX = 1900
+
+
+def _truncate(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def build_channel_notification(request: GLPIWebhookRequest, summary_line: str) -> str:
+    """Readable multiline message for Slack + Discord (description included)."""
+    tid = request.item_id
+    header = f"New GLPI ticket #{tid}" if tid is not None else "New GLPI ticket"
+    lines: list[str] = [header]
+
+    if request.name:
+        lines.append(str(request.name))
+    lines.append("")
+
+    meta_parts: list[str] = []
+    if request.priority is not None:
+        try:
+            pv = int(request.priority)
+        except (TypeError, ValueError):
+            pv = request.priority
+        pmap = {1: "Very low", 2: "Low", 3: "Medium", 4: "High", 5: "Critical"}
+        meta_parts.append(f"Priority: {pmap.get(pv, pv)}")
+    if request.status is not None:
+        meta_parts.append(f"Status: {request.status}")
+    if request.category:
+        meta_parts.append(f"Category: {request.category}")
+    if request.requester:
+        meta_parts.append(f"Requester: {request.requester}")
+    if request.assignee:
+        meta_parts.append(f"Assigned: {request.assignee}")
+    if meta_parts:
+        lines.append(" | ".join(meta_parts))
+        lines.append("")
+
+    lines.append(f"Summary: {summary_line}")
+    lines.append("")
+
+    desc = _strip_html(request.description or "")
+    if desc:
+        lines.append("Description:")
+        lines.append(_truncate(desc, 1200))
+    else:
+        lines.append("(No description in payload)")
+
+    if tid is not None:
+        lines.append("")
+        lines.append(
+            f"📎 DataPilot: Reply in this channel to add a follow-up on ticket #{tid}, "
+            f"or say “new ticket …” to open one. (Slack Events API → POST /integrations/slack/events)"
+        )
+
+    body = "\n".join(lines)
+    return _truncate(body, _DISCORD_MAX)
+
 
 class GLPIWebhookService:
-    """Service to process GLPI webhook notifications and optionally forward alerts."""
+    """Process GLPI webhooks: alert channels, then optionally update the ticket via API."""
 
     def __init__(
         self,
-        alert_service: "AlertService | None" = None,
+        alert_service: Any = None,
         auto_forward: bool = True,
     ) -> None:
-        """Initialize GLPI webhook service.
-
-        Args:
-            alert_service: AlertService instance for forwarding notifications
-            auto_forward: Whether to automatically forward to Slack/Discord
-        """
         self._alert_service = alert_service
         self._auto_forward = auto_forward
-
-        # Event type patterns that can be sent to alerts
-        self._forwardable_events = {
-            "ticket.created",
-            "ticket.updated",
-            "ticket.closed",
-            "ticket.resolved",
-            "ticket.reply",
-            "ticket.note",
-            "ticket.assigned",
-            "ticket.priority_changed",
-            "ticket.status_changed",
-        }
-
-        # Priority to emoji mapping
-        self._priority_emoji = {
-            1: "1 (Low)",
-            2: "2 (Medium)",
-            3: "3 (High)",
-            4: "4 (Critical)",
-            5: "5 (Emergency)",
-        }
 
     def process_webhook(
         self,
         payload: dict[str, Any],
         forward_to_alert: bool = True,
     ) -> GLPIWebhookResponse:
-        """Process incoming GLPI webhook payload.
-
-        Args:
-            payload: Raw webhook payload from GLPI
-            forward_to_alert: Whether to forward to alert service
-
-        Returns:
-            GLPIWebhookResponse with processing results
-        """
         try:
-            # Extract event type from common GLPI webhook fields
             event_type = self._extract_event_type(payload)
-
-            # Parse common GLPI fields
             parsed = self._parse_glpi_payload(payload)
-
-            # Create structured request
             request = GLPIWebhookRequest(
                 event_type=event_type,
                 raw_payload=payload,
                 **parsed,
             )
 
-            logger.info(f"Processed GLPI webhook: {event_type} - {parsed.get('name', 'N/A')}")
+            logger.info("GLPI webhook: event=%s ticket=%s name=%s", event_type, request.item_id, request.name)
+
+            if not self._should_notify(event_type, request):
+                return GLPIWebhookResponse(
+                    ok=True,
+                    message=f"Skipped notify for event {event_type!r} (open-only mode or not a new ticket)",
+                    processed=True,
+                    alert_sent=False,
+                )
+
+            summary = get_ai_message_service().generate_ticket_message(
+                {
+                    "name": request.name,
+                    "description": request.description,
+                    "priority": request.priority,
+                    "status": request.status,
+                    "category": request.category,
+                    "requester": request.requester,
+                    "assignee": request.assignee,
+                    "event_type": request.event_type,
+                    "item_id": request.item_id,
+                }
+            )
+            message = build_channel_notification(request, summary)
 
             alert_sent = False
+            alert_results: dict[str, Any] = {}
             if forward_to_alert and self._auto_forward and self._alert_service:
-                alert_sent = self._forward_to_alert(request)
+                try:
+                    alert_results = self._alert_service.send(message, channel="both")
+                    alert_sent = any(
+                        v.get("status") == "success" for v in alert_results.values() if isinstance(v, dict)
+                    )
+                except Exception as e:
+                    logger.error("Alert send failed: %s", e)
+
+            glpi_followup_ok: bool | None = None
+            glpi_followup_error: str | None = None
+            glpi_status_updated: bool | None = None
+            glpi_status_error: str | None = None
+
+            if request.item_id is not None and GLPI_WEBHOOK_ADD_FOLLOWUP:
+                api = get_glpi_api_service()
+                if api.is_configured():
+                    follow_lines = [
+                        "DataPilot agent notified Slack/Discord about this ticket.",
+                        f"Summary: {summary}",
+                    ]
+                    if alert_sent:
+                        follow_lines.append("Channels: webhook delivery reported success for at least one target.")
+                    else:
+                        follow_lines.append("Note: webhook delivery may be skipped or failed — check DataPilot logs.")
+                    fr = api.add_ticket_followup(request.item_id, "\n".join(follow_lines))
+                    glpi_followup_ok = bool(fr.get("ok"))
+                    if not glpi_followup_ok:
+                        glpi_followup_error = str(fr.get("error", "followup failed"))[:500]
+                else:
+                    glpi_followup_ok = False
+                    glpi_followup_error = (
+                        "GLPI REST env missing or not loaded: set GLPI_API_URL "
+                        "(e.g. http://host:8080/apirest.php), GLPI_APP_TOKEN, "
+                        "GLPI_USER_TOKEN in DataPilot/.env and restart the API."
+                    )
+
+            status_id_raw = GLPI_WEBHOOK_STATUS_ID
+            if request.item_id is not None and status_id_raw:
+                try:
+                    sid = int(status_id_raw)
+                    api = get_glpi_api_service()
+                    if api.is_configured():
+                        sr = api.update_ticket_status(request.item_id, sid)
+                        glpi_status_updated = bool(sr.get("ok"))
+                        if not glpi_status_updated:
+                            glpi_status_error = str(sr.get("error", "status update failed"))[:500]
+                except ValueError:
+                    glpi_status_error = f"Invalid GLPI_WEBHOOK_STATUS_ID: {status_id_raw!r}"
 
             return GLPIWebhookResponse(
                 ok=True,
-                message=f"Processed {event_type} for item #{request.item_id}",
+                message=f"Processed {event_type} for ticket #{request.item_id}",
                 processed=True,
                 alert_sent=alert_sent,
+                glpi_followup_ok=glpi_followup_ok,
+                glpi_followup_error=glpi_followup_error,
+                glpi_status_updated=glpi_status_updated,
+                glpi_status_error=glpi_status_error,
             )
 
         except Exception as e:
-            logger.error(f"Error processing GLPI webhook: {e}")
-            return GLPIWebhookResponse(
-                ok=False,
-                error=str(e),
-                processed=False,
-            )
+            logger.error("GLPI webhook error: %s", e)
+            return GLPIWebhookResponse(ok=False, error=str(e), processed=False)
+
+    def _should_notify(self, event_type: str | None, request: GLPIWebhookRequest) -> bool:
+        et = (event_type or "unknown").lower().replace(" ", "_")
+        mode = GLPI_WEBHOOK_EVENTS_MODE
+
+        if mode == "all":
+            return et in _OPEN_TICKET_EVENTS or et in _EXTENDED_EVENTS
+
+        if et in _OPEN_TICKET_EVENTS:
+            return True
+
+        it = (request.item_type or "").lower()
+        if it == "ticket" and request.item_id is not None:
+            if et in ("unknown", "", "created", "new", "add"):
+                return True
+            if "creat" in et or et.endswith(".new") or "open" in et:
+                return True
+
+        return False
 
     def _extract_event_type(self, payload: dict[str, Any]) -> str | None:
-        """Extract event type from various GLPI webhook formats."""
-        # Direct event field
         if "event" in payload:
-            return payload["event"]
-
+            return str(payload["event"])
         if "event_type" in payload:
-            return payload["event_type"]
-
+            return str(payload["event_type"])
         if "type" in payload:
-            return payload["type"]
-
-        # Check for itemtype and id pattern
+            return str(payload["type"])
         if "itemtype" in payload or "item_type" in payload:
             item_type = payload.get("itemtype") or payload.get("item_type")
-            action = payload.get("action", "created")
-            return f"{item_type.lower()}.{action}"
-
-        # Check for glpi event format
-        if "glpi" in payload:
-            glpi_data = payload.get("glpi", {})
-            if "event" in glpi_data:
-                return glpi_data["event"]
-
+            action = str(payload.get("action", "created")).lower()
+            return f"{str(item_type).lower()}.{action}"
+        if "glpi" in payload and isinstance(payload["glpi"], dict):
+            ge = payload["glpi"].get("event")
+            if ge:
+                return str(ge)
         return "unknown"
 
     def _parse_glpi_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Parse common GLPI fields from various webhook formats."""
-        result = {}
+        merged: dict[str, Any] = dict(payload)
+        for key in ("ticket", "item", "data", "object", "record"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                merged.update(nested)
+        inp = merged.get("input")
+        if isinstance(inp, dict):
+            merged.update(inp)
 
-        # Try common field mappings
+        result: dict[str, Any] = {}
         field_mappings = {
-            "item_id": ["id", "item_id", "itemid", "ticket_id"],
+            "item_id": ["id", "item_id", "itemid", "ticket_id", "items_id"],
             "item_type": ["itemtype", "item_type", "type", "object"],
-            "name": ["name", "title", "subject", "name"],
+            "name": ["name", "title", "subject"],
             "status": ["status", "state", "statut"],
             "priority": ["priority", "urgency", "urgency_id"],
-            "category": ["category", "category_id", "itilcategories_id", "type"],
+            "category": ["category", "category_id", "itilcategories_id", "itilcategories_id_label"],
             "entity": ["entity", "entity_id", "entities_id"],
-            "requester": ["requester", "requester_id", "user_id", "author"],
-            "assignee": ["assignee", "assigned_to", "tech_id", "assign_to_user"],
-            "description": ["description", "content", "details", "body"],
-            "date_creation": ["date_creation", "date_creation", "created_at", "created"],
-            "date_mod": ["date_mod", "date_mod", "updated_at", "modified"],
+            "requester": ["requester", "requester_id", "user_id", "author", "users_id_recipient"],
+            "assignee": ["assignee", "assigned_to", "tech_id", "assign_to_user", "users_id_tech"],
+            "description": ["description", "content", "details", "body", "text"],
+            "date_creation": ["date_creation", "created_at", "created"],
+            "date_mod": ["date_mod", "updated_at", "modified"],
         }
 
         for target, sources in field_mappings.items():
             for source in sources:
-                if source in payload:
-                    value = payload[source]
-                    # Convert priority to int if possible
-                    if target == "priority" and value is not None:
+                if source in merged and merged[source] is not None:
+                    value = merged[source]
+                    if target == "priority":
                         try:
                             value = int(value)
                         except (ValueError, TypeError):
@@ -159,94 +307,11 @@ class GLPIWebhookService:
 
         return result
 
-    def _forward_to_alert(self, request: GLPIWebhookRequest) -> bool:
-        """Forward GLPI notification to configured alert channels."""
-        if not self._alert_service:
-            return False
 
-        # Only forward certain event types
-        if request.event_type not in self._forwardable_events:
-            logger.debug(f"Skipping forward for event type: {request.event_type}")
-            return False
-
-        # Build alert message
-        message = self._build_alert_message(request)
-
-        # Send to both Slack and Discord
-        try:
-            result = self._alert_service.send(message, channel="both")
-            # Check if at least one succeeded
-            for channel, status in result.items():
-                if status.get("status") == "success":
-                    logger.info(f"GLPI alert forwarded to {channel}")
-                    return True
-            return False
-        except Exception as e:
-            logger.error(f"Failed to forward GLPI alert: {e}")
-            return False
-
-    def _build_alert_message(self, request: GLPIWebhookRequest) -> str:
-        """Build alert message from GLPI webhook data."""
-        parts = []
-
-        # Event type with emoji
-        event_emoji = self._get_event_emoji(request.event_type or "unknown")
-        parts.append(f"{event_emoji} *{request.event_type or 'GLPI Event'}*")
-
-        # Ticket/item info
-        if request.item_id:
-            parts.append(f"**Ticket #{request.item_id}**")
-
-        if request.name:
-            # Truncate long names
-            name = request.name[:80] + "..." if len(request.name) > 80 else request.name
-            parts.append(f"_{name}_")
-
-        # Priority
-        if request.priority is not None:
-            priority_text = self._priority_emoji.get(request.priority, str(request.priority))
-            parts.append(f"Priority: {priority_text}")
-
-        # Status
-        if request.status:
-            parts.append(f"Status: {request.status}")
-
-        # Category
-        if request.category:
-            parts.append(f"Category: {request.category}")
-
-        # Requester
-        if request.requester:
-            parts.append(f"Requester: {request.requester}")
-
-        # Assignee
-        if request.assignee:
-            parts.append(f"Assigned to: {request.assignee}")
-
-        return " | ".join(parts)
-
-    def _get_event_emoji(self, event_type: str) -> str:
-        """Get emoji for event type."""
-        emojis = {
-            "ticket.created": "🆕",
-            "ticket.updated": "🔄",
-            "ticket.closed": "✅",
-            "ticket.resolved": "✔️",
-            "ticket.reply": "💬",
-            "ticket.note": "📝",
-            "ticket.assigned": "👤",
-            "ticket.priority_changed": "⬆️",
-            "ticket.status_changed": "📊",
-        }
-        return emojis.get(event_type, "🔔")
-
-
-# Singleton instance (will be initialized in main.py)
 _glpi_webhook_service: GLPIWebhookService | None = None
 
 
-def get_glpi_webhook_service(alert_service: "AlertService | None" = None) -> GLPIWebhookService:
-    """Get or create GLPI webhook service singleton."""
+def get_glpi_webhook_service(alert_service: Any = None) -> GLPIWebhookService:
     global _glpi_webhook_service
     if _glpi_webhook_service is None:
         _glpi_webhook_service = GLPIWebhookService(alert_service=alert_service)

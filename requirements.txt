@@ -15,3 +15,4 @@ apscheduler
 reportlab
 python-dotenv
 requests
+PyJWT
